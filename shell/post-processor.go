@@ -12,7 +12,9 @@ import (
 	"strings"
 
 	"github.com/mitchellh/packer/common"
+	"github.com/mitchellh/packer/helper/config"
 	"github.com/mitchellh/packer/packer"
+	"github.com/mitchellh/packer/template/interpolate"
 )
 
 type Config struct {
@@ -37,21 +39,20 @@ type Config struct {
 
 	TargetPath string `mapstructure:"target"`
 
-	tpl *packer.ConfigTemplate
+	ctx interpolate.Context
 }
 
 type ShellPostProcessor struct {
 	cfg Config
 }
 
-type OutputPathTemplate struct {
-	ArtifactId string
-	BuildName  string
-	Provider   string
-}
-
 func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
-	_, err := common.DecodeConfig(&p.cfg, raws...)
+	err := config.Decode(&p.cfg, &config.DecodeOpts{
+		Interpolate: true,
+		InterpolateFilter: &interpolate.RenderFilter{
+			Exclude: []string{},
+		},
+	}, raws...)
 	if err != nil {
 		return err
 	}
@@ -79,50 +80,8 @@ func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
 		p.cfg.Scripts = []string{p.cfg.Script}
 	}
 
-	p.cfg.tpl, err = packer.NewConfigTemplate()
-	if err != nil {
-		return err
-	}
-	p.cfg.tpl.UserVars = p.cfg.PackerUserVars
-
 	if p.cfg.TargetPath == "" {
 		p.cfg.TargetPath = "packer_{{ .BuildName }}_{{.Provider}}"
-	}
-
-	if err = p.cfg.tpl.Validate(p.cfg.TargetPath); err != nil {
-		errs = packer.MultiErrorAppend(
-			errs, fmt.Errorf("Error parsing target template: %s", err))
-	}
-
-	templates := map[string]*string{
-		"inline_shebang": &p.cfg.InlineShebang,
-		"script":         &p.cfg.Script,
-	}
-
-	for n, ptr := range templates {
-		var err error
-		*ptr, err = p.cfg.tpl.Process(*ptr, nil)
-		if err != nil {
-			errs = packer.MultiErrorAppend(
-				errs, fmt.Errorf("Error processing %s: %s", n, err))
-		}
-	}
-
-	sliceTemplates := map[string][]string{
-		"inline":           p.cfg.Inline,
-		"scripts":          p.cfg.Scripts,
-		"environment_vars": p.cfg.Vars,
-	}
-
-	for n, slice := range sliceTemplates {
-		for i, elem := range slice {
-			var err error
-			slice[i], err = p.cfg.tpl.Process(elem, nil)
-			if err != nil {
-				errs = packer.MultiErrorAppend(
-					errs, fmt.Errorf("Error processing %s[%d]: %s", n, i, err))
-			}
-		}
 	}
 
 	if len(p.cfg.Scripts) == 0 && p.cfg.Inline == nil {
@@ -194,7 +153,7 @@ func (p *ShellPostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact)
 	files := artifact.Files()
 	var stderr bytes.Buffer
 	var stdout bytes.Buffer
-	fmt.Printf("%+v\n", artifact)
+
 	for _, art := range files {
 		for _, path := range scripts {
 			stderr.Reset()
