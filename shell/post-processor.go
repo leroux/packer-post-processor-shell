@@ -1,3 +1,5 @@
+// This package implements a post-processor for Packer that executes
+// shell scripts locally.
 package shell
 
 import (
@@ -20,35 +22,38 @@ import (
 type Config struct {
 	common.PackerConfig `mapstructure:",squash"`
 
+	// Fields from config file
+	OutputPath        string `mapstructure:"output"`
+	KeepInputArtifact bool   `mapstructure:"keep_input_artifact"`
+
 	// An inline script to execute. Multiple strings are all executed
 	// in the context of a single shell.
-	Inline []string `mapstructure:"inline"`
+	Inline []string
 
 	// The shebang value used when running inline scripts.
 	InlineShebang string `mapstructure:"inline_shebang"`
 
 	// The local path of the shell script to upload and execute.
-	Script string `mapstructure:"script"`
+	Script string
+
+	// An array of multiple scripts to run.
+	Scripts []string
 
 	// An array of environment variables that will be injected before
 	// your command(s) are executed.
 	Vars []string `mapstructure:"environment_vars"`
 
-	// An array of multiple scripts to run.
-	Scripts []string `mapstructure:"scripts"`
-
-	TargetPath string `mapstructure:"target"`
-
 	ctx interpolate.Context
 }
 
-type ShellPostProcessor struct {
-	cfg Config
+type PostProcessor struct {
+	config Config
 }
 
-func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
-	err := config.Decode(&p.cfg, &config.DecodeOpts{
-		Interpolate: true,
+func (p *PostProcessor) Configure(raws ...interface{}) error {
+	err := config.Decode(&p.config, &config.DecodeOpts{
+		Interpolate:        true,
+		InterpolateContext: &p.config.ctx,
 		InterpolateFilter: &interpolate.RenderFilter{
 			Exclude: []string{},
 		},
@@ -57,42 +62,41 @@ func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
 		return err
 	}
 
-	errs := new(packer.MultiError)
-
-	if p.cfg.InlineShebang == "" {
-		p.cfg.InlineShebang = "/bin/sh"
+	if p.config.Inline != nil && len(p.config.Inline) == 0 {
+		p.config.Inline = nil
 	}
 
-	if p.cfg.Scripts == nil {
-		p.cfg.Scripts = make([]string, 0)
+	if p.config.InlineShebang == "" {
+		p.config.InlineShebang = "/bin/sh -e"
 	}
 
-	if p.cfg.Vars == nil {
-		p.cfg.Vars = make([]string, 0)
+	if p.config.Scripts == nil {
+		p.config.Scripts = make([]string, 0)
 	}
 
-	if p.cfg.Script != "" && len(p.cfg.Scripts) > 0 {
+	if p.config.Vars == nil {
+		p.config.Vars = make([]string, 0)
+	}
+
+	var errs *packer.MultiError
+	if p.config.Script != "" && len(p.config.Scripts) > 0 {
 		errs = packer.MultiErrorAppend(errs,
 			errors.New("Only one of script or scripts can be specified."))
 	}
 
-	if p.cfg.Script != "" {
-		p.cfg.Scripts = []string{p.cfg.Script}
+	if p.config.Script != "" {
+		p.config.Scripts = []string{p.config.Script}
 	}
 
-	if p.cfg.TargetPath == "" {
-		p.cfg.TargetPath = "packer_{{ .BuildName }}_{{.Provider}}"
-	}
-
-	if len(p.cfg.Scripts) == 0 && p.cfg.Inline == nil {
+	if len(p.config.Scripts) == 0 && p.config.Inline == nil {
 		errs = packer.MultiErrorAppend(errs,
 			errors.New("Either a script file or inline script must be specified."))
-	} else if len(p.cfg.Scripts) > 0 && p.cfg.Inline != nil {
+	} else if len(p.config.Scripts) > 0 && p.config.Inline != nil {
 		errs = packer.MultiErrorAppend(errs,
 			errors.New("Only a script file or an inline script can be specified, not both."))
 	}
 
-	for _, path := range p.cfg.Scripts {
+	for _, path := range p.config.Scripts {
 		if _, err := os.Stat(path); err != nil {
 			errs = packer.MultiErrorAppend(errs,
 				fmt.Errorf("Bad script '%s': %s", path, err))
@@ -100,11 +104,17 @@ func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
 	}
 
 	// Do a check for bad environment variables, such as '=foo', 'foobar'
-	for _, kv := range p.cfg.Vars {
+	for idx, kv := range p.config.Vars {
 		vs := strings.SplitN(kv, "=", 2)
 		if len(vs) != 2 || vs[0] == "" {
 			errs = packer.MultiErrorAppend(errs,
 				fmt.Errorf("Environment variable not in format 'key=value': %s", kv))
+		} else {
+			// Replace single quotes so they parse
+			vs[1] = strings.Replace(vs[1], "'", `'"'"'`, -1)
+
+			// Single quote env var values
+			p.config.Vars[idx] = fmt.Sprintf("%s=%s", vs[0], vs[1])
 		}
 	}
 
@@ -115,11 +125,16 @@ func (p *ShellPostProcessor) Configure(raws ...interface{}) error {
 	return nil
 }
 
-func (p *ShellPostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, error) {
-	scripts := make([]string, len(p.cfg.Scripts))
-	copy(scripts, p.cfg.Scripts)
+func (p *PostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, error) {
 
-	if p.cfg.Inline != nil {
+	keep := p.config.KeepInputArtifact
+
+	scripts := make([]string, len(p.config.Scripts))
+	copy(scripts, p.config.Scripts)
+
+	// If we have an inline script, then turn that into a temporary
+	// shell script and use that.
+	if p.config.Inline != nil {
 		tf, err := ioutil.TempFile("", "packer-shell")
 		if err != nil {
 			return nil, false, fmt.Errorf("Error preparing shell script: %s", err)
@@ -131,8 +146,8 @@ func (p *ShellPostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact)
 
 		// Write our contents to it
 		writer := bufio.NewWriter(tf)
-		writer.WriteString(fmt.Sprintf("#!%s\n", p.cfg.InlineShebang))
-		for _, command := range p.cfg.Inline {
+		writer.WriteString(fmt.Sprintf("#!%s\n", p.config.InlineShebang))
+		for _, command := range p.config.Inline {
 			if _, err := writer.WriteString(command + "\n"); err != nil {
 				return nil, false, fmt.Errorf("Error preparing shell script: %s", err)
 			}
@@ -145,20 +160,22 @@ func (p *ShellPostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact)
 		tf.Close()
 	}
 
-	envVars := make([]string, len(p.cfg.Vars)+2)
-	envVars[0] = "PACKER_BUILD_NAME=" + p.cfg.PackerBuildName
-	envVars[1] = "PACKER_BUILDER_TYPE=" + p.cfg.PackerBuilderType
-	copy(envVars[2:], p.cfg.Vars)
+	// Build our variables up by adding in the build name and builder type
+	envVars := make([]string, len(p.config.Vars)+2)
+	envVars[0] = fmt.Sprintf("PACKER_BUILD_NAME='%s'", p.config.PackerBuildName)
+	envVars[1] = fmt.Sprintf("PACKER_BUILDER_TYPE='%s'", p.config.PackerBuilderType)
+	copy(envVars[2:], p.config.Vars)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
 
 	files := artifact.Files()
-	var stderr bytes.Buffer
-	var stdout bytes.Buffer
-
 	for _, art := range files {
 		for _, path := range scripts {
-			stderr.Reset()
 			stdout.Reset()
-			ui.Say(fmt.Sprintf("Process with shell script: %s", path))
+			stderr.Reset()
+
+			ui.Say(fmt.Sprintf("Processing with shell script: %s", path))
 
 			log.Printf("Opening %s for reading", path)
 			f, err := os.Open(path)
@@ -168,17 +185,25 @@ func (p *ShellPostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact)
 			defer f.Close()
 
 			ui.Message(fmt.Sprintf("Executing script with artifact: %s", art))
-			args := []string{path, art}
-			cmd := exec.Command("/bin/sh", args...)
+			command := strings.Join([]string{path, art}, " ")
+			log.Printf("Executing shell command: %s", command)
+			cmd := exec.Command("sh", "-c", command)
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr
-			cmd.Env = envVars
+			cmd.Env = append(os.Environ(), envVars...)
 			err = cmd.Run()
+
+			stdoutString := strings.TrimSpace(stdout.String())
+			stderrString := strings.TrimSpace(stderr.String())
+
 			if err != nil {
-				return nil, false, fmt.Errorf("Unable to execute script: %s", stderr.String())
+				return nil, false, fmt.Errorf("Error executing script: %s", stderrString)
 			}
-			ui.Message(fmt.Sprintf("%s", stderr.String()))
+
+			log.Printf("stdout: %s", stdoutString)
+			log.Printf("stderr: %s", stderrString)
 		}
 	}
-	return artifact, false, nil
+
+	return artifact, keep, nil
 }
