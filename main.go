@@ -2,7 +2,7 @@ package main
 
 import (
 	"github.com/mitchellh/packer/packer/plugin"
-	"github.com/vtolstov/packer-post-processor-shell/shell"
+	"github.com/podpolkovnick/packer-post-processor-shell/shell"
 )
 
 func main() {
